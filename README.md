@@ -1,0 +1,2 @@
+# KQLTutor
+Kusto Query Language 
