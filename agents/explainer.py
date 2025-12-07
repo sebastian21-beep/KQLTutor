@@ -1,4 +1,5 @@
 from .base import AgentResult, LLMClient
+from kql_rules import explain_natural
 
 class ExplainerAgent:
     def __init__(self, use_google: bool = False):
@@ -6,14 +7,12 @@ class ExplainerAgent:
 
     def run(self, context: dict) -> AgentResult:
         q = context.get("optimized_query", context.get("query", ""))
-        parts = [p.strip() for p in q.split("|") if p.strip()]
-        desc = []
-        for i, p in enumerate(parts):
-            desc.append(str(i + 1) + ": " + p)
-        text = "\n".join(desc)
+        text, classification = explain_natural(q)
         if self.llm.use_google:
-            g = self.llm.generate("Explain KQL result and each pipe stage: " + q)
+            g = self.llm.generate("Explain KQL result and each pipe stage in 3-4 sentences: " + q)
             if g:
                 text = g
-        return AgentResult(title="Explainer", content=text)
-
+        schema = context.get("schema") or {}
+        if schema and classification:
+            classification = classification + " Using table: " + str(schema.get("suggested_table"))
+        return AgentResult(title="Explainer", content=text, hints=[classification] if classification else None)
