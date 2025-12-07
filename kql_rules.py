@@ -27,7 +27,7 @@ def analyze_kql(q: str) -> dict:
         errors.append("Remove duplicate pipes")
     return {"hints": hints, "errors": errors, "optimizations": optimizations}
 
-def fix_query(q: str, suggested_table: str | None = None) -> str:
+def fix_query(q: str, suggested_table: str | None = None, task: str | None = None) -> str:
     x = q
     x = re.sub(r"\|\|+", "|", x)
     if re.search(r"\|\s*summarize\b.*\|\s*where\b", x):
@@ -45,6 +45,31 @@ def fix_query(q: str, suggested_table: str | None = None) -> str:
     x = re.sub(r"^\s*Table\b", repl, x.strip())
     if not has_time_filter(x):
         x = insert_after_table(x, "where TimeGenerated >= ago(24h)")
+    
+    # Fix incorrect EventID values based on task context
+    if task:
+        task_lower = task.lower()
+        # If task mentions failed logins/logons, ensure EventID is 4625
+        if ("failed" in task_lower and ("login" in task_lower or "logon" in task_lower)) or "4625" in task:
+            # Check if EventID exists but is wrong
+            eventid_match = re.search(r"EventID\s*==\s*(\d+)", x, re.IGNORECASE)
+            if eventid_match:
+                current_eventid = eventid_match.group(1)
+                if current_eventid != "4625":
+                    # Replace incorrect EventID with 4625
+                    x = re.sub(r"EventID\s*==\s*\d+", "EventID == 4625", x, flags=re.IGNORECASE)
+            elif "eventid" not in x.lower():
+                # Add EventID 4625 if missing
+                # Find the where clause and add EventID filter
+                where_match = re.search(r"where\s+([^|]+)", x, re.IGNORECASE)
+                if where_match:
+                    where_content = where_match.group(1)
+                    # Add "and EventID == 4625" to the where clause
+                    x = re.sub(r"(where\s+[^|]+)", r"\1 and EventID == 4625", x, flags=re.IGNORECASE, count=1)
+                else:
+                    # No where clause, add one after table
+                    x = insert_after_table(x, "where EventID == 4625")
+    
     return x.strip()
 
 def has_time_filter(q: str) -> bool:
@@ -61,6 +86,8 @@ def compute_diffs(original: str, fixed: str) -> list:
     diffs = []
     o = original.strip()
     f = fixed.strip()
+    o_lower = o.lower()
+    f_lower = f.lower()
     if re.match(r"^\s*Table\b", o) and not re.match(r"^\s*Table\b", f):
         diffs.append("Replaced placeholder table with suggested dataset")
     if "||" in o and "||" not in f:
@@ -71,6 +98,19 @@ def compute_diffs(original: str, fixed: str) -> list:
         diffs.append("Added 'by' to summarize count()")
     if not has_time_filter(o) and has_time_filter(f):
         diffs.append("Added TimeGenerated time filter")
+    # Check for EventID corrections
+    o_eventid = re.search(r"EventID\s*==\s*(\d+)", o_lower)
+    f_eventid = re.search(r"EventID\s*==\s*(\d+)", f_lower)
+    if o_eventid and f_eventid:
+        o_val = o_eventid.group(1)
+        f_val = f_eventid.group(1)
+        if o_val != f_val:
+            diffs.append(f"Corrected EventID from {o_val} to {f_val}")
+    elif o_eventid and not f_eventid:
+        # EventID was removed (shouldn't happen, but check anyway)
+        pass
+    elif not o_eventid and f_eventid:
+        diffs.append(f"Added EventID filter: {f_eventid.group(1)}")
     return diffs
 
 def render_commented_query(fixed: str, diffs: list) -> str:
@@ -173,3 +213,86 @@ def explain_natural(q: str) -> tuple[str, str | None]:
     if fail_clause:
         classification = "This is a hunting query for failed logons; you could turn it into an analytic rule by adding thresholds and scheduling."
     return " ".join(s), classification
+def assess_task(task: str, q: str, schema: dict | None = None) -> tuple[bool, list, str, str]:
+    mismatches = []
+    fulfills = True  # Start optimistic, but check thoroughly
+    reason = ""
+    qn = q.strip().lower()
+    t = (task or "").lower()
+    suggested = (schema or {}).get("suggested_table")
+    
+    # Check if query is empty or too basic
+    if not q or not q.strip() or len(q.strip()) < 10:
+        fulfills = False
+        mismatches.append("Query is empty or too basic")
+        return fulfills, mismatches, q, "Query is empty or too basic"
+    
+    # Check table name
+    if suggested and not q.strip().startswith(suggested):
+        fulfills = False
+        mismatches.append(f"Uses a different table than suggested ({suggested})")
+    
+    # Check time filters - look for various time patterns
+    time_patterns = [
+        r"24h", r"24\s*h", r"ago\(24h\)", r"ago\(1d\)",
+        r"7d", r"7\s*d", r"ago\(7d\)",
+        r"today", r"startofday",
+        r"TimeGenerated\s*>=\s*ago",
+        r"Timestamp\s*>=\s*ago"
+    ]
+    has_time = any(re.search(pattern, qn, re.IGNORECASE) for pattern in time_patterns) or has_time_filter(q)
+    
+    if "24h" in t or "24 hours" in t or "last 24" in t:
+        if not has_time:
+            fulfills = False
+            mismatches.append("Missing 24h time filter (should use ago(24h) or similar)")
+    elif "7d" in t or "7 days" in t or "last 7" in t:
+        if not has_time:
+            fulfills = False
+            mismatches.append("Missing 7d time filter (should use ago(7d) or similar)")
+    elif "today" in t:
+        if not (has_time or "startofday" in qn):
+            fulfills = False
+            mismatches.append("Missing today time filter (should use startofday(now()) or similar)")
+    elif any(time_word in t for time_word in ["time", "ago", "recent", "last"]):
+        if not has_time:
+            fulfills = False
+            mismatches.append("Missing time filter")
+    
+    # Check for distinct hosts
+    if "distinct hosts" in t or "distinct host" in t:
+        if not (re.search(r"distinct\s+hostname", qn) or re.search(r"summarize\b.*hostname", qn) or re.search(r"dcount.*hostname", qn)):
+            fulfills = False
+            mismatches.append("Missing distinct HostName operation")
+    
+    # Check for failed logins
+    if "failed" in t and ("login" in t or "logon" in t):
+        eventid_match = re.search(r"EventID\s*==\s*(\d+)", qn)
+        if eventid_match:
+            eventid_value = eventid_match.group(1)
+            if eventid_value != "4625":
+                fulfills = False
+                mismatches.append(f"Incorrect EventID {eventid_value} (should be 4625 for failed logons)")
+        elif "4625" not in q and "eventid" not in qn and "resulttype" not in qn:
+            fulfills = False
+            mismatches.append("Missing failed login filter (EventID 4625 or ResultType)")
+    
+    # Check for specific aggregations mentioned in task
+    if "count" in t and "per" in t:
+        if "summarize" not in qn and "count()" not in qn:
+            fulfills = False
+            mismatches.append("Missing count aggregation (summarize count())")
+    
+    if "top" in t or "5" in t or "10" in t:
+        if "top" not in qn and "limit" not in qn:
+            fulfills = False
+            mismatches.append("Missing top/limit clause")
+    
+    corrected = q
+    if mismatches:
+        corrected = fix_query(q, suggested_table=suggested, task=task)
+    if fulfills:
+        reason = "Query aligns with task requirements"
+    else:
+        reason = "Query diverges from task: " + "; ".join(mismatches)
+    return fulfills, mismatches, corrected, reason
